@@ -1,4 +1,3 @@
-
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { env as workerEnv } from "cloudflare:workers";
@@ -338,10 +337,167 @@ function formatTenraiError(error: unknown): string {
   return String(error);
 }
 
+// ---------- TMDB details diagnostic helpers ----------
+
+const TMDB_TV_ID = 209867;
+const TMDB_GAP_MS = 500;
+
+type TmdbCall = {
+  endpoint: string;
+  http_status: number | null;
+  elapsed_ms: number;
+  ok: boolean;
+  error: string | null;
+  data: unknown;
+};
+
+type TmdbTv = {
+  name?: string;
+  original_name?: string;
+  overview?: string;
+  first_air_date?: string;
+  last_air_date?: string;
+  status?: string;
+  in_production?: boolean;
+  number_of_seasons?: number;
+  number_of_episodes?: number;
+  vote_average?: number;
+  vote_count?: number;
+  genres?: { name?: string }[];
+};
+
+type TmdbTranslations = {
+  translations?: {
+    iso_639_1?: string;
+    data?: { name?: string; overview?: string };
+  }[];
+};
+
+type TmdbImage = {
+  file_path?: string;
+  width?: number;
+  height?: number;
+  iso_639_1?: string | null;
+  vote_average?: number;
+  vote_count?: number;
+};
+
+type TmdbImages = {
+  posters?: TmdbImage[];
+  backdrops?: TmdbImage[];
+};
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+// One GET, no retries. Never returns or logs the token.
+async function tmdbCall(
+  path: string,
+  params: Record<string, string>,
+  token: string,
+): Promise<TmdbCall> {
+  const query = new URLSearchParams(params).toString();
+  const endpoint = query ? `${path}?${query}` : path;
+  const started = Date.now();
+
+  try {
+    const response = await fetch(`${TMDB_API}${endpoint}`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+
+    const elapsed_ms = Date.now() - started;
+    const raw = await response.text();
+
+    let data: unknown;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return {
+        endpoint,
+        http_status: response.status,
+        elapsed_ms,
+        ok: false,
+        error: "invalid JSON",
+        data: null,
+      };
+    }
+
+    if (!response.ok) {
+      const msg = (data as { status_message?: string })?.status_message;
+      return {
+        endpoint,
+        http_status: response.status,
+        elapsed_ms,
+        ok: false,
+        error: msg ?? "Unknown API error",
+        data: null,
+      };
+    }
+
+    return {
+      endpoint,
+      http_status: response.status,
+      elapsed_ms,
+      ok: true,
+      error: null,
+      data,
+    };
+  } catch (error) {
+    return {
+      endpoint,
+      http_status: null,
+      elapsed_ms: Date.now() - started,
+      ok: false,
+      error: error instanceof Error ? error.name : "network error",
+      data: null,
+    };
+  }
+}
+
+// Empty strings and missing values count as "not available".
+function orNull<T>(value: T | null | undefined): T | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  return value;
+}
+
+function countByLanguage(items: TmdbImage[]): Record<string, number> {
+  return items.reduce<Record<string, number>>((acc, img) => {
+    const key = img.iso_639_1 ?? "none";
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, {});
+}
+
+function sampleImages(
+  items: TmdbImage[],
+  size: "w500" | "w1280",
+  kind: string,
+) {
+  return [...items]
+    .filter((img) => Boolean(img.file_path))
+    .sort((a, b) => (b.vote_average ?? 0) - (a.vote_average ?? 0))
+    .slice(0, 10)
+    .map((img) => ({
+      kind,
+      language: img.iso_639_1 ?? "none",
+      width: img.width ?? null,
+      height: img.height ?? null,
+      vote_average: img.vote_average ?? null,
+      url: `https://image.tmdb.org/t/p/${size}${img.file_path}`,
+    }));
+}
+
 function createServer() {
   const server = new McpServer({
     name: "Anime Elara Publisher",
-    version: "2.3.1",
+    version: "2.3.2",
   });
 
   // TMDB read-only diagnostic.
@@ -483,6 +639,126 @@ function createServer() {
           }. Credential value was not exposed.`,
         );
       }
+    },
+  );
+
+  // TMDB details + images diagnostic (read-only, fixed ID).
+  // 3 sequential requests max, no retries, no image downloads, no Telegram.
+  server.registerTool(
+    "diagnose_tmdb_details",
+    {
+      description:
+        "Read-only TMDB diagnostic for Frieren: Beyond Journey's End (TV ID 209867). Fetches details, translations and images sequentially with no retries. Downloads no images, never publishes to Telegram, never reveals credentials.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      const token = workerEnv.TMDB_READ_TOKEN;
+
+      if (!token) {
+        return errorResult(
+          "TMDB_READ_TOKEN is missing from Cloudflare Secrets.",
+        );
+      }
+
+      const base = `/tv/${TMDB_TV_ID}`;
+
+      // Sequential, with a small gap between requests.
+      const details = await tmdbCall(base, { language: "en-US" }, token);
+      await sleep(TMDB_GAP_MS);
+
+      const translations = await tmdbCall(
+        `${base}/translations`,
+        {},
+        token,
+      );
+      await sleep(TMDB_GAP_MS);
+
+      const images = await tmdbCall(
+        `${base}/images`,
+        { include_image_language: "en,ar,ja,null" },
+        token,
+      );
+
+      // Details
+      const show = (details.data ?? {}) as TmdbTv;
+      const basic = {
+        original_name: orNull(show.original_name),
+        english_name: orNull(show.name),
+        overview_en: orNull(show.overview),
+        first_air_date: orNull(show.first_air_date),
+        last_air_date: orNull(show.last_air_date),
+        status: orNull(show.status),
+        in_production: orNull(show.in_production),
+        number_of_seasons: orNull(show.number_of_seasons),
+        number_of_episodes: orNull(show.number_of_episodes),
+        vote_average: orNull(show.vote_average),
+        vote_count: orNull(show.vote_count),
+        genres: (show.genres ?? [])
+          .map((g) => g.name)
+          .filter((n): n is string => Boolean(n)),
+      };
+
+      const missingFields = Object.entries(basic)
+        .filter(([, v]) => v === null || (Array.isArray(v) && v.length === 0))
+        .map(([k]) => k);
+
+      // Translations: checked directly, not via fallback names in details.
+      const translationList =
+        ((translations.data ?? {}) as TmdbTranslations).translations ?? [];
+
+      const translationReport = ["en", "ar", "ja"].map((code) => {
+        const t = translationList.find((x) => x.iso_639_1 === code);
+        return {
+          language: code,
+          available: Boolean(t),
+          name: orNull(t?.data?.name),
+          overview_present: Boolean(t?.data?.overview),
+        };
+      });
+
+      // Images
+      const imageData = (images.data ?? {}) as TmdbImages;
+      const posters = imageData.posters ?? [];
+      const backdrops = imageData.backdrops ?? [];
+
+      const calls = { details, translations, images };
+
+      const report = {
+        ok: Object.values(calls).every((c) => c.ok),
+        service: "TMDB",
+        tv_id: TMDB_TV_ID,
+        requests: Object.fromEntries(
+          Object.entries(calls).map(([name, c]) => [
+            name,
+            {
+              endpoint_path: c.endpoint,
+              http_status: c.http_status,
+              elapsed_ms: c.elapsed_ms,
+              ok: c.ok,
+              error: c.error,
+            },
+          ]),
+        ),
+        details: { ...basic, missing_fields: missingFields },
+        translations: translationReport,
+        images: {
+          posters_total: posters.length,
+          backdrops_total: backdrops.length,
+          posters_by_language: countByLanguage(posters),
+          backdrops_by_language: countByLanguage(backdrops),
+          poster_samples: sampleImages(posters, "w500", "poster"),
+          backdrop_samples: sampleImages(backdrops, "w1280", "backdrop"),
+        },
+        note:
+          "Read-only. 3 sequential requests, no retries, no image downloads, no Telegram action. Credentials not exposed.",
+      };
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify(report, null, 2),
+        }],
+      };
     },
   );
 
