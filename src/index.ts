@@ -351,6 +351,14 @@ type TmdbCall = {
   data: unknown;
 };
 
+type TmdbSeason = {
+  id?: number;
+  season_number?: number;
+  name?: string;
+  episode_count?: number;
+  air_date?: string | null;
+};
+
 type TmdbTv = {
   name?: string;
   original_name?: string;
@@ -364,6 +372,7 @@ type TmdbTv = {
   vote_average?: number;
   vote_count?: number;
   genres?: { name?: string }[];
+  seasons?: TmdbSeason[];
 };
 
 type TmdbTranslations = {
@@ -385,6 +394,38 @@ type TmdbImage = {
 type TmdbImages = {
   posters?: TmdbImage[];
   backdrops?: TmdbImage[];
+};
+
+type SeasonGroup = "main" | "specials";
+
+type SeasonSummary = {
+  season_number: number;
+  name: string | null;
+  episode_count: number | null;
+  air_date: string | null;
+  group: SeasonGroup;
+};
+
+type SeasonComparison =
+  | "unavailable"
+  | "incomplete_counts"
+  | "match_main"
+  | "match_including_specials"
+  | "mismatch";
+
+type SeasonSummaryReport = {
+  available: boolean;
+  reason: string | null;
+  reported_seasons_count: number;
+  list: SeasonSummary[];
+  unclassified_season_entries: number;
+  missing_episode_count_seasons: number[];
+  main_episode_sum: number | null;
+  specials_episode_sum: number | null;
+  all_episode_sum: number | null;
+  number_of_episodes: number | null;
+  comparison: SeasonComparison;
+  comparison_detail: string | null;
 };
 
 function sleep(ms: number) {
@@ -415,6 +456,7 @@ async function tmdbCall(
     const raw = await response.text();
 
     let data: unknown;
+
     try {
       data = JSON.parse(raw);
     } catch {
@@ -430,6 +472,7 @@ async function tmdbCall(
 
     if (!response.ok) {
       const msg = (data as { status_message?: string })?.status_message;
+
       return {
         endpoint,
         http_status: response.status,
@@ -494,10 +537,156 @@ function sampleImages(
     }));
 }
 
+// Splits main seasons from Specials, calculates complete sums,
+// and compares them with TMDB's total episode count.
+// Missing or invalid data is never treated as zero.
+function summarizeSeasons(
+  seasons: TmdbSeason[] | undefined,
+  numberOfEpisodes: number | undefined,
+): SeasonSummaryReport {
+  if (!Array.isArray(seasons)) {
+    return {
+      available: false,
+      reason: "TMDB did not return a seasons array.",
+      reported_seasons_count: 0,
+      list: [],
+      unclassified_season_entries: 0,
+      missing_episode_count_seasons: [],
+      main_episode_sum: null,
+      specials_episode_sum: null,
+      all_episode_sum: null,
+      number_of_episodes:
+        typeof numberOfEpisodes === "number" &&
+        Number.isInteger(numberOfEpisodes) &&
+        numberOfEpisodes >= 0
+          ? numberOfEpisodes
+          : null,
+      comparison: "unavailable",
+      comparison_detail: "Season data is unavailable.",
+    };
+  }
+
+  const list: SeasonSummary[] = seasons
+    .filter(
+      (season): season is TmdbSeason & { season_number: number } =>
+        typeof season.season_number === "number" &&
+        Number.isInteger(season.season_number) &&
+        season.season_number >= 0,
+    )
+    .map((season) => ({
+      season_number: season.season_number,
+      name: orNull(season.name),
+      episode_count:
+        typeof season.episode_count === "number" &&
+        Number.isInteger(season.episode_count) &&
+        season.episode_count >= 0
+          ? season.episode_count
+          : null,
+      air_date: orNull(season.air_date),
+      group: season.season_number === 0 ? "specials" : "main",
+    }))
+    .sort((a, b) => a.season_number - b.season_number);
+
+  // Entries without a valid non-negative integer season_number
+  // are excluded from sums and reported separately.
+  const unclassifiedSeasonEntries = seasons.length - list.length;
+
+  const mainList = list.filter((season) => season.group === "main");
+  const specialsList = list.filter((season) => season.group === "specials");
+
+  const missingEpisodeCountSeasons = list
+    .filter((season) => season.episode_count === null)
+    .map((season) => season.season_number);
+
+  // A sum is reported only when every season in that group has
+  // a valid episode_count. Otherwise it remains null.
+  function completeSum(items: SeasonSummary[]): number | null {
+    if (items.some((season) => season.episode_count === null)) {
+      return null;
+    }
+
+    return items.reduce(
+      (sum, season) => sum + (season.episode_count ?? 0),
+      0,
+    );
+  }
+
+  const mainEpisodeSum = completeSum(mainList);
+  const specialsEpisodeSum = completeSum(specialsList);
+
+  const allEpisodeSum =
+    missingEpisodeCountSeasons.length === 0 &&
+    unclassifiedSeasonEntries === 0
+      ? (mainEpisodeSum ?? 0) + (specialsEpisodeSum ?? 0)
+      : null;
+
+  const total =
+    typeof numberOfEpisodes === "number" &&
+    Number.isInteger(numberOfEpisodes) &&
+    numberOfEpisodes >= 0
+      ? numberOfEpisodes
+      : null;
+
+  let comparison: SeasonComparison;
+  let comparisonDetail: string | null = null;
+
+  if (total === null) {
+    comparison = "unavailable";
+    comparisonDetail =
+      "TMDB number_of_episodes is missing or invalid.";
+  } else if (
+    missingEpisodeCountSeasons.length > 0 ||
+    unclassifiedSeasonEntries > 0
+  ) {
+    comparison = "incomplete_counts";
+
+    const reasons: string[] = [];
+
+    if (missingEpisodeCountSeasons.length > 0) {
+      reasons.push(
+        `episode_count missing or invalid for season(s): ${missingEpisodeCountSeasons.join(", ")}`,
+      );
+    }
+
+    if (unclassifiedSeasonEntries > 0) {
+      reasons.push(
+        `${unclassifiedSeasonEntries} season entry/entries have an invalid or missing season_number.`,
+      );
+    }
+
+    comparisonDetail = reasons.join(" ");
+  } else if (total === mainEpisodeSum) {
+    comparison = "match_main";
+  } else if (total === allEpisodeSum) {
+    comparison = "match_including_specials";
+    comparisonDetail =
+      "TMDB number_of_episodes matches the sum including Season 0 (Specials).";
+  } else {
+    comparison = "mismatch";
+    comparisonDetail =
+      "The reported total does not match the main-season sum or the sum including Specials. No automatic correction applied.";
+  }
+
+  return {
+    available: true,
+    reason: null,
+    reported_seasons_count: seasons.length,
+    list,
+    unclassified_season_entries: unclassifiedSeasonEntries,
+    missing_episode_count_seasons: missingEpisodeCountSeasons,
+    main_episode_sum: mainEpisodeSum,
+    specials_episode_sum: specialsEpisodeSum,
+    all_episode_sum: allEpisodeSum,
+    number_of_episodes: total,
+    comparison,
+    comparison_detail: comparisonDetail,
+  };
+}
+
 function createServer() {
   const server = new McpServer({
     name: "Anime Elara Publisher",
-    version: "2.3.2",
+    version: "2.3.3",
   });
 
   // TMDB read-only diagnostic.
@@ -642,13 +831,13 @@ function createServer() {
     },
   );
 
-  // TMDB details + images diagnostic (read-only, fixed ID).
-  // 3 sequential requests max, no retries, no image downloads, no Telegram.
+  // TMDB details + seasons + translations + images (read-only).
+  // Exactly 3 sequential requests, no retries, no image downloads, no Telegram.
   server.registerTool(
     "diagnose_tmdb_details",
     {
       description:
-        "Read-only TMDB diagnostic for Frieren: Beyond Journey's End (TV ID 209867). Fetches details, translations and images sequentially with no retries. Downloads no images, never publishes to Telegram, never reveals credentials.",
+        "Read-only TMDB diagnostic for Frieren: Beyond Journey's End (TV ID 209867). Fetches details including seasons, translations and images sequentially with no retries. Splits main seasons from Specials, compares episode totals, downloads no images, never publishes to Telegram, never reveals credentials.",
       inputSchema: z.object({}),
     },
     async () => {
@@ -662,17 +851,25 @@ function createServer() {
 
       const base = `/tv/${TMDB_TV_ID}`;
 
-      // Sequential, with a small gap between requests.
-      const details = await tmdbCall(base, { language: "en-US" }, token);
+      // Request 1: details, including the seasons array.
+      const details = await tmdbCall(
+        base,
+        { language: "en-US" },
+        token,
+      );
+
       await sleep(TMDB_GAP_MS);
 
+      // Request 2: translations.
       const translations = await tmdbCall(
         `${base}/translations`,
         {},
         token,
       );
+
       await sleep(TMDB_GAP_MS);
 
+      // Request 3: image metadata only. No image files are downloaded.
       const images = await tmdbCall(
         `${base}/images`,
         { include_image_language: "en,ar,ja,null" },
@@ -681,6 +878,7 @@ function createServer() {
 
       // Details
       const show = (details.data ?? {}) as TmdbTv;
+
       const basic = {
         original_name: orNull(show.original_name),
         english_name: orNull(show.name),
@@ -694,25 +892,38 @@ function createServer() {
         vote_average: orNull(show.vote_average),
         vote_count: orNull(show.vote_count),
         genres: (show.genres ?? [])
-          .map((g) => g.name)
-          .filter((n): n is string => Boolean(n)),
+          .map((genre) => genre.name)
+          .filter((name): name is string => Boolean(name)),
       };
 
       const missingFields = Object.entries(basic)
-        .filter(([, v]) => v === null || (Array.isArray(v) && v.length === 0))
-        .map(([k]) => k);
+        .filter(
+          ([, value]) =>
+            value === null ||
+            (Array.isArray(value) && value.length === 0),
+        )
+        .map(([key]) => key);
+
+      // Seasons: main seasons and Season 0 (Specials).
+      const seasonReport = summarizeSeasons(
+        show.seasons,
+        show.number_of_episodes,
+      );
 
       // Translations: checked directly, not via fallback names in details.
       const translationList =
         ((translations.data ?? {}) as TmdbTranslations).translations ?? [];
 
       const translationReport = ["en", "ar", "ja"].map((code) => {
-        const t = translationList.find((x) => x.iso_639_1 === code);
+        const translation = translationList.find(
+          (item) => item.iso_639_1 === code,
+        );
+
         return {
           language: code,
-          available: Boolean(t),
-          name: orNull(t?.data?.name),
-          overview_present: Boolean(t?.data?.overview),
+          available: Boolean(translation),
+          name: orNull(translation?.data?.name),
+          overview_present: Boolean(translation?.data?.overview),
         };
       });
 
@@ -724,33 +935,88 @@ function createServer() {
       const calls = { details, translations, images };
 
       const report = {
-        ok: Object.values(calls).every((c) => c.ok),
+        ok: Object.values(calls).every((call) => call.ok),
         service: "TMDB",
         tv_id: TMDB_TV_ID,
+
         requests: Object.fromEntries(
-          Object.entries(calls).map(([name, c]) => [
+          Object.entries(calls).map(([name, call]) => [
             name,
             {
-              endpoint_path: c.endpoint,
-              http_status: c.http_status,
-              elapsed_ms: c.elapsed_ms,
-              ok: c.ok,
-              error: c.error,
+              endpoint_path: call.endpoint,
+              http_status: call.http_status,
+              elapsed_ms: call.elapsed_ms,
+              ok: call.ok,
+              error: call.error,
             },
           ]),
         ),
-        details: { ...basic, missing_fields: missingFields },
+
+        details: {
+          ...basic,
+          missing_fields: missingFields,
+        },
+
+        seasons: {
+          available: seasonReport.available,
+          reason: seasonReport.reason,
+          reported_seasons_count:
+            seasonReport.reported_seasons_count,
+
+          main_seasons: seasonReport.list.filter(
+            (season) => season.group === "main",
+          ),
+
+          specials: seasonReport.list.filter(
+            (season) => season.group === "specials",
+          ),
+
+          unclassified_season_entries:
+            seasonReport.unclassified_season_entries,
+
+          missing_episode_count_seasons:
+            seasonReport.missing_episode_count_seasons,
+
+          totals: {
+            main_episode_sum:
+              seasonReport.main_episode_sum,
+
+            specials_episode_sum:
+              seasonReport.specials_episode_sum,
+
+            all_episode_sum:
+              seasonReport.all_episode_sum,
+
+            number_of_episodes:
+              seasonReport.number_of_episodes,
+          },
+
+          comparison: seasonReport.comparison,
+          comparison_detail:
+            seasonReport.comparison_detail,
+        },
+
         translations: translationReport,
+
         images: {
           posters_total: posters.length,
           backdrops_total: backdrops.length,
-          posters_by_language: countByLanguage(posters),
-          backdrops_by_language: countByLanguage(backdrops),
-          poster_samples: sampleImages(posters, "w500", "poster"),
-          backdrop_samples: sampleImages(backdrops, "w1280", "backdrop"),
+
+          posters_by_language:
+            countByLanguage(posters),
+
+          backdrops_by_language:
+            countByLanguage(backdrops),
+
+          poster_samples:
+            sampleImages(posters, "w500", "poster"),
+
+          backdrop_samples:
+            sampleImages(backdrops, "w1280", "backdrop"),
         },
+
         note:
-          "Read-only. 3 sequential requests, no retries, no image downloads, no Telegram action. Credentials not exposed.",
+          "Read-only. Exactly 3 sequential requests, no retries, no image downloads, no Telegram action. Credentials not exposed.",
       };
 
       return {
