@@ -1,4 +1,3 @@
-
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { env as workerEnv } from "cloudflare:workers";
@@ -14,7 +13,6 @@ declare global {
 const CHANNEL = "@anime_elara";
 const TENRAI_API = "https://api.tenrai.org/v1";
 const TELEGRAM_API = `https://api.telegram.org/bot${workerEnv.TELEGRAM_BOT_TOKEN}`;
-
 const MAX_PHOTO_SIZE = 9 * 1024 * 1024;
 const MAX_ALBUM_IMAGE_SIZE = 5 * 1024 * 1024;
 const MAX_ALBUM_TOTAL_SIZE = 25 * 1024 * 1024;
@@ -43,15 +41,133 @@ type AnimeEntry = {
   images?: ImageSet;
 };
 
-// Picture endpoints return jpg/webp directly,
-// unlike search endpoints which use an "images" property.
+// Picture endpoints return jpg/webp directly, unlike search endpoints.
 type PictureEntry = ImageSet;
+
+type TenraiPayload<T> = {
+  data?: T[];
+  message?: string;
+  error?: string;
+  type?: string;
+};
+
+class TenraiApiError extends Error {
+  status: number;
+  endpoint: string;
+  retryAfter: string | null;
+  rateLimitHeaders: Record<string, string>;
+  responseBody: string;
+
+  constructor(
+    message: string,
+    status: number,
+    endpoint: string,
+    retryAfter: string | null,
+    rateLimitHeaders: Record<string, string>,
+    responseBody: string,
+  ) {
+    super(message);
+    this.name = "TenraiApiError";
+    this.status = status;
+    this.endpoint = endpoint;
+    this.retryAfter = retryAfter;
+    this.rateLimitHeaders = rateLimitHeaders;
+    this.responseBody = responseBody;
+  }
+}
 
 function errorResult(message: string) {
   return {
     isError: true,
     content: [{ type: "text" as const, text: message }],
   };
+}
+
+function safeEndpoint(path: string): string {
+  // Only API path/query is reported; no secrets or authorization data.
+  return `${TENRAI_API}${path}`;
+}
+
+function getRateLimitHeaders(headers: Headers): Record<string, string> {
+  const selected: Record<string, string> = {};
+  for (const [name, value] of headers.entries()) {
+    const lower = name.toLowerCase();
+    if (
+      lower === "retry-after" ||
+      lower.includes("ratelimit") ||
+      lower.includes("rate-limit") ||
+      lower.includes("quota")
+    ) {
+      selected[name] = value;
+    }
+  }
+  return selected;
+}
+
+function parseTenraiBody<T>(raw: string): TenraiPayload<T> | null {
+  try {
+    return JSON.parse(raw) as TenraiPayload<T>;
+  } catch {
+    return null;
+  }
+}
+
+// One request only. No automatic retries.
+async function tenraiRequest<T>(path: string) {
+  const endpoint = safeEndpoint(path);
+  const started = Date.now();
+
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (error) {
+    const elapsedMs = Date.now() - started;
+    throw new Error(
+      `Tenrai network/timeout error after ${elapsedMs}ms for ${path}: ${String(error)}`,
+    );
+  }
+
+  const elapsedMs = Date.now() - started;
+  const raw = await response.text();
+  const payload = parseTenraiBody<T>(raw);
+  const retryAfter = response.headers.get("retry-after");
+  const rateLimitHeaders = getRateLimitHeaders(response.headers);
+
+  if (!response.ok || !payload || !Array.isArray(payload.data)) {
+    const message =
+      payload?.message ||
+      payload?.error ||
+      payload?.type ||
+      (response.status === 429
+        ? "Tenrai rate limit exceeded"
+        : `Tenrai API error: HTTP ${response.status}`);
+
+    throw new TenraiApiError(
+      message,
+      response.status,
+      path,
+      retryAfter,
+      rateLimitHeaders,
+      raw.slice(0, 700),
+    );
+  }
+
+  return {
+    data: payload.data,
+    status: response.status,
+    elapsedMs,
+    retryAfter,
+    rateLimitHeaders,
+    endpointPath: path,
+  };
+}
+
+async function tenraiGet<T>(path: string): Promise<T[]> {
+  const result = await tenraiRequest<T>(path);
+  return result.data;
 }
 
 // Telegram JSON request
@@ -66,34 +182,27 @@ async function telegramJson(
   });
 
   const result = (await response.json()) as TelegramResult;
-
   if (!response.ok || !result.ok) {
     throw new Error(
       result.description || `Telegram HTTP ${response.status}`,
     );
   }
-
   return result;
 }
 
 // Telegram multipart upload
-async function telegramForm(
-  method: string,
-  form: FormData,
-) {
+async function telegramForm(method: string, form: FormData) {
   const response = await fetch(`${TELEGRAM_API}/${method}`, {
     method: "POST",
     body: form,
   });
 
   const result = (await response.json()) as TelegramResult;
-
   if (!response.ok || !result.ok) {
     throw new Error(
       result.description || `Telegram HTTP ${response.status}`,
     );
   }
-
   return result;
 }
 
@@ -103,7 +212,6 @@ async function downloadImage(
   maxBytes: number,
 ): Promise<{ blob: Blob; type: string }> {
   const url = new URL(imageUrl);
-
   if (
     url.protocol !== "https:" ||
     url.username ||
@@ -114,9 +222,7 @@ async function downloadImage(
     url.hostname.startsWith("[") ||
     /^\d{1,3}(\.\d{1,3}){3}$/.test(url.hostname)
   ) {
-    throw new Error(
-      "رابط الصورة غير مسموح به. استخدم رابط HTTPS عام.",
-    );
+    throw new Error("رابط الصورة غير مسموح به. استخدم رابط HTTPS عام.");
   }
 
   const response = await fetch(url.toString(), {
@@ -134,15 +240,12 @@ async function downloadImage(
   ).split(";")[0].trim().toLowerCase();
 
   if (!["image/jpeg", "image/png", "image/webp"].includes(type)) {
-    throw new Error(
-      "الرابط لا يشير إلى صورة JPEG أو PNG أو WebP.",
-    );
+    throw new Error("الرابط لا يشير إلى صورة JPEG أو PNG أو WebP.");
   }
 
   const contentLength = Number(
     response.headers.get("content-length") || 0,
   );
-
   if (contentLength > maxBytes) {
     throw new Error("حجم الصورة أكبر من الحد المسموح.");
   }
@@ -153,16 +256,13 @@ async function downloadImage(
 
   while (true) {
     const { done, value } = await reader.read();
-
     if (done) break;
 
     total += value.length;
-
     if (total > maxBytes) {
       await reader.cancel();
       throw new Error("حجم الصورة أكبر من الحد المسموح.");
     }
-
     chunks.push(value);
   }
 
@@ -187,51 +287,7 @@ function extensionFor(type: string) {
   return "jpg";
 }
 
-// Tenrai API request helper
-async function tenraiGet<T>(path: string): Promise<T[]> {
-  const response = await fetch(
-    `${TENRAI_API}${path}`,
-    {
-      headers: {
-        Accept: "application/json",
-      },
-      signal: AbortSignal.timeout(20000),
-    },
-  );
-
-  const raw = await response.text();
-
-  let payload: {
-    data?: T[];
-    message?: string;
-    error?: string;
-    type?: string;
-  };
-
-  try {
-    payload = JSON.parse(raw) as typeof payload;
-  } catch {
-    throw new Error(
-      `Tenrai returned an invalid response. HTTP ${response.status}`,
-    );
-  }
-
-  if (!response.ok || !Array.isArray(payload.data)) {
-    throw new Error(
-      payload.message ||
-      payload.error ||
-      payload.type ||
-      `Tenrai API error: HTTP ${response.status}`,
-    );
-  }
-
-  return payload.data;
-}
-
-// Extract the best available image URL.
-function getImageUrl(
-  images?: ImageSet,
-): string | undefined {
+function getImageUrl(images?: ImageSet): string | undefined {
   return (
     images?.webp?.large_image_url ||
     images?.webp?.image_url ||
@@ -240,27 +296,82 @@ function getImageUrl(
   );
 }
 
-// Build a safe anime search query.
 function searchUrl(query: string, limit: number) {
-  const params = new URLSearchParams({
+  return new URLSearchParams({
     q: query,
     limit: String(limit),
     "sfw-strict": "true",
-  });
+  }).toString();
+}
 
-  return params.toString();
+function formatTenraiError(error: unknown): string {
+  if (error instanceof TenraiApiError) {
+    return [
+      `Tenrai request failed`,
+      `HTTP status: ${error.status}`,
+      `Endpoint path: ${error.endpoint}`,
+      `Retry-After: ${error.retryAfter ?? "not provided"}`,
+      `Rate-limit headers: ${JSON.stringify(error.rateLimitHeaders)}`,
+      `Message: ${error.message}`,
+      `Response body (first 700 chars): ${error.responseBody || "(empty)"}`,
+    ].join("\n");
+  }
+  return String(error);
 }
 
 function createServer() {
   const server = new McpServer({
     name: "Anime Elara Publisher",
-    version: "2.2.0",
+    version: "2.3.0",
   });
 
-  // ==========================================
-  // 1. Search anime and character images
-  // ==========================================
+  // Read-only diagnostic: makes exactly ONE Tenrai request.
+  server.registerTool(
+    "diagnose_tenrai",
+    {
+      description:
+        "Make exactly one read-only request to Tenrai character search and report HTTP status, response time, Retry-After, and a short safe response summary. Never publishes to Telegram.",
+      inputSchema: z.object({
+        query: z.string().min(2).max(100).default("Naruto"),
+      }),
+    },
+    async ({ query }) => {
+      const path = `/characters?${searchUrl(query, 1)}`;
+      try {
+        const result = await tenraiRequest<AnimeEntry>(path);
+        const first = result.data[0];
 
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              ok: true,
+              service: "Tenrai",
+              endpoint_path: result.endpointPath,
+              http_status: result.status,
+              elapsed_ms: result.elapsedMs,
+              retry_after: result.retryAfter,
+              rate_limit_headers: result.rateLimitHeaders,
+              result_count: result.data.length,
+              first_result: first
+                ? {
+                    mal_id: first.mal_id,
+                    name: first.name ?? null,
+                    has_image: Boolean(getImageUrl(first.images)),
+                    source_url: first.url ?? null,
+                  }
+                : null,
+              note: "One request only. No images downloaded. No Telegram action.",
+            }, null, 2),
+          }],
+        };
+      } catch (error) {
+        return errorResult(formatTenraiError(error));
+      }
+    },
+  );
+
+  // Search anime and character images
   server.registerTool(
     "search_anime_images",
     {
@@ -268,17 +379,14 @@ function createServer() {
         "Search Tenrai anime database for character images, anime covers, or anime galleries. Returns direct image URLs and source links. Use this tool to find images before publishing. Never publish unless the user explicitly asks.",
       inputSchema: z.object({
         query: z.string().min(2).max(100),
-
         kind: z.enum([
           "character",
           "anime_cover",
           "anime_gallery",
         ]).default("character"),
-
         max_results: z.number().int().min(1).max(8).default(6),
       }),
     },
-
     async ({ query, kind, max_results }) => {
       try {
         const results: {
@@ -290,7 +398,6 @@ function createServer() {
 
         const params = searchUrl(query, 5);
 
-        // Character search
         if (kind === "character") {
           const matches = await tenraiGet<AnimeEntry>(
             `/characters?${params}`,
@@ -298,7 +405,6 @@ function createServer() {
 
           for (const item of matches) {
             const image = getImageUrl(item.images);
-
             if (image) {
               results.push({
                 name: item.name || "Unknown character",
@@ -309,17 +415,15 @@ function createServer() {
             }
           }
 
-          // Fetch additional pictures for the best match.
+          // Sequential second request for the best match only.
           if (matches.length > 0) {
             const best = matches[0];
-
             const pictures = await tenraiGet<PictureEntry>(
               `/characters/${best.mal_id}/pictures`,
             );
 
             for (const picture of pictures) {
               const image = getImageUrl(picture);
-
               if (image) {
                 results.push({
                   name: best.name || "Character gallery",
@@ -332,15 +436,12 @@ function createServer() {
           }
         }
 
-        // Anime cover search
         if (kind === "anime_cover") {
           const matches = await tenraiGet<AnimeEntry>(
             `/anime?${params}`,
           );
-
           for (const item of matches) {
             const image = getImageUrl(item.images);
-
             if (image) {
               results.push({
                 name: item.title || "Unknown anime",
@@ -352,7 +453,6 @@ function createServer() {
           }
         }
 
-        // Anime gallery search
         if (kind === "anime_gallery") {
           const matches = await tenraiGet<AnimeEntry>(
             `/anime?${params}`,
@@ -360,14 +460,12 @@ function createServer() {
 
           if (matches.length > 0) {
             const best = matches[0];
-
             const pictures = await tenraiGet<PictureEntry>(
               `/anime/${best.mal_id}/pictures`,
             );
 
             for (const picture of pictures) {
               const image = getImageUrl(picture);
-
               if (image) {
                 results.push({
                   name: best.title || "Anime gallery",
@@ -378,10 +476,8 @@ function createServer() {
               }
             }
 
-            // If no gallery pictures exist, use the cover.
             if (results.length === 0) {
               const cover = getImageUrl(best.images);
-
               if (cover) {
                 results.push({
                   name: best.title || "Anime cover",
@@ -394,7 +490,6 @@ function createServer() {
           }
         }
 
-        // Remove duplicate image URLs.
         const unique = [
           ...new Map(
             results.map((item) => [item.image_url, item]),
@@ -423,16 +518,13 @@ function createServer() {
         };
       } catch (error) {
         return errorResult(
-          `فشل البحث عن الصور: ${String(error)}`,
+          `فشل البحث عن الصور:\n${formatTenraiError(error)}`,
         );
       }
     },
   );
 
-  // ==========================================
-  // 2. Publish text
-  // ==========================================
-
+  // Publish text
   server.registerTool(
     "publish_text",
     {
@@ -442,14 +534,12 @@ function createServer() {
         message: z.string().min(1).max(4096),
       }),
     },
-
     async ({ message }) => {
       try {
         await telegramJson("sendMessage", {
           chat_id: CHANNEL,
           text: message,
         });
-
         return {
           content: [{
             type: "text",
@@ -457,17 +547,12 @@ function createServer() {
           }],
         };
       } catch (error) {
-        return errorResult(
-          `فشل نشر النص: ${String(error)}`,
-        );
+        return errorResult(`فشل نشر النص: ${String(error)}`);
       }
     },
   );
 
-  // ==========================================
-  // 3. Publish one photo + caption
-  // ==========================================
-
+  // Publish one photo + caption
   server.registerTool(
     "publish_photo",
     {
@@ -478,30 +563,19 @@ function createServer() {
         caption: z.string().max(1024).optional(),
       }),
     },
-
     async ({ image_url, caption }) => {
       try {
-        const image = await downloadImage(
-          image_url,
-          MAX_PHOTO_SIZE,
-        );
-
+        const image = await downloadImage(image_url, MAX_PHOTO_SIZE);
         const form = new FormData();
-
         form.set("chat_id", CHANNEL);
-
         form.set(
           "photo",
           image.blob,
           `anime-image.${extensionFor(image.type)}`,
         );
-
-        if (caption) {
-          form.set("caption", caption);
-        }
+        if (caption) form.set("caption", caption);
 
         await telegramForm("sendPhoto", form);
-
         return {
           content: [{
             type: "text",
@@ -509,17 +583,12 @@ function createServer() {
           }],
         };
       } catch (error) {
-        return errorResult(
-          `فشل نشر الصورة: ${String(error)}`,
-        );
+        return errorResult(`فشل نشر الصورة: ${String(error)}`);
       }
     },
   );
 
-  // ==========================================
-  // 4. Publish photo album
-  // ==========================================
-
+  // Publish photo album
   server.registerTool(
     "publish_album",
     {
@@ -529,15 +598,12 @@ function createServer() {
         image_urls: z.array(
           z.string().url().max(2048),
         ).min(2).max(10),
-
         caption: z.string().max(1024).optional(),
       }),
     },
-
     async ({ image_urls, caption }) => {
       try {
         const form = new FormData();
-
         form.set("chat_id", CHANNEL);
 
         const media: {
@@ -555,7 +621,6 @@ function createServer() {
           );
 
           totalSize += image.blob.size;
-
           if (totalSize > MAX_ALBUM_TOTAL_SIZE) {
             throw new Error(
               "الحجم الإجمالي للألبوم أكبر من الحد المسموح.",
@@ -563,7 +628,6 @@ function createServer() {
           }
 
           const attachmentName = `photo_${i}`;
-
           form.set(
             attachmentName,
             image.blob,
@@ -579,15 +643,11 @@ function createServer() {
             media: `attach://${attachmentName}`,
           };
 
-          if (i === 0 && caption) {
-            item.caption = caption;
-          }
-
+          if (i === 0 && caption) item.caption = caption;
           media.push(item);
         }
 
         form.set("media", JSON.stringify(media));
-
         await telegramForm("sendMediaGroup", form);
 
         return {
@@ -597,9 +657,7 @@ function createServer() {
           }],
         };
       } catch (error) {
-        return errorResult(
-          `فشل نشر الألبوم: ${String(error)}`,
-        );
+        return errorResult(`فشل نشر الألبوم: ${String(error)}`);
       }
     },
   );
@@ -607,12 +665,7 @@ function createServer() {
   return server;
 }
 
-// MCP handler
 const handler = createMcpHandler(createServer);
-
-// ==========================================
-// Protected Worker entry point
-// ==========================================
 
 export default {
   async fetch(
@@ -622,36 +675,24 @@ export default {
   ) {
     const secret = workerEnv.MCP_ACCESS_TOKEN;
 
-    if (
-      !secret ||
-      !workerEnv.TELEGRAM_BOT_TOKEN
-    ) {
+    if (!secret || !workerEnv.TELEGRAM_BOT_TOKEN) {
       return new Response("Server configuration error", {
         status: 503,
       });
     }
 
     const url = new URL(request.url);
-
     const protectedPath = `/s/${secret}/mcp`;
 
     if (url.pathname !== protectedPath) {
       return new Response("Not found", {
         status: 404,
-        headers: {
-          "Cache-Control": "no-store",
-        },
+        headers: { "Cache-Control": "no-store" },
       });
     }
 
-    // Rewrite protected path to the normal MCP endpoint.
     url.pathname = "/mcp";
-
-    const mcpRequest = new Request(
-      url.toString(),
-      request,
-    );
-
+    const mcpRequest = new Request(url.toString(), request);
     return handler(mcpRequest, env, ctx);
   },
 } satisfies ExportedHandler<Env>;
