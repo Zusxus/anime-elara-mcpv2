@@ -12,6 +12,7 @@ declare global {
 }
 
 const CHANNEL = "@anime_elara";
+const TENRAI_API = "https://api.tenrai.org/v1";
 const TELEGRAM_API = `https://api.telegram.org/bot${workerEnv.TELEGRAM_BOT_TOKEN}`;
 
 const MAX_PHOTO_SIZE = 9 * 1024 * 1024;
@@ -24,24 +25,27 @@ type TelegramResult = {
   result?: unknown;
 };
 
-type JikanImageSet = {
-  jpg?: {
-    image_url?: string;
-    large_image_url?: string;
-  };
-  webp?: {
-    image_url?: string;
-    large_image_url?: string;
-  };
+type ImageFormat = {
+  image_url?: string;
+  large_image_url?: string;
 };
 
-type JikanEntry = {
+type ImageSet = {
+  jpg?: ImageFormat;
+  webp?: ImageFormat;
+};
+
+type AnimeEntry = {
   mal_id: number;
   name?: string;
   title?: string;
   url?: string;
-  images?: JikanImageSet;
+  images?: ImageSet;
 };
+
+// Picture endpoints return jpg/webp directly,
+// unlike search endpoints which use an "images" property.
+type PictureEntry = ImageSet;
 
 function errorResult(message: string) {
   return {
@@ -50,6 +54,7 @@ function errorResult(message: string) {
   };
 }
 
+// Telegram JSON request
 async function telegramJson(
   method: string,
   data: Record<string, unknown>,
@@ -71,6 +76,7 @@ async function telegramJson(
   return result;
 }
 
+// Telegram multipart upload
 async function telegramForm(
   method: string,
   form: FormData,
@@ -91,6 +97,7 @@ async function telegramForm(
   return result;
 }
 
+// Download and validate an image before uploading it.
 async function downloadImage(
   imageUrl: string,
   maxBytes: number,
@@ -107,7 +114,9 @@ async function downloadImage(
     url.hostname.startsWith("[") ||
     /^\d{1,3}(\.\d{1,3}){3}$/.test(url.hostname)
   ) {
-    throw new Error("رابط الصورة غير مسموح به. استخدم رابط HTTPS عام.");
+    throw new Error(
+      "رابط الصورة غير مسموح به. استخدم رابط HTTPS عام.",
+    );
   }
 
   const response = await fetch(url.toString(), {
@@ -125,7 +134,9 @@ async function downloadImage(
   ).split(";")[0].trim().toLowerCase();
 
   if (!["image/jpeg", "image/png", "image/webp"].includes(type)) {
-    throw new Error("الرابط لا يشير إلى صورة JPEG أو PNG أو WebP.");
+    throw new Error(
+      "الرابط لا يشير إلى صورة JPEG أو PNG أو WebP.",
+    );
   }
 
   const contentLength = Number(
@@ -142,6 +153,7 @@ async function downloadImage(
 
   while (true) {
     const { done, value } = await reader.read();
+
     if (done) break;
 
     total += value.length;
@@ -175,34 +187,51 @@ function extensionFor(type: string) {
   return "jpg";
 }
 
-// Jikan API helper
-async function jikanGet<T>(path: string): Promise<T[]> {
+// Tenrai API request helper
+async function tenraiGet<T>(path: string): Promise<T[]> {
   const response = await fetch(
-    `https://api.jikan.moe/v4${path}`,
+    `${TENRAI_API}${path}`,
     {
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(15000),
+      headers: {
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(20000),
     },
   );
 
-  const payload = (await response.json()) as {
+  const raw = await response.text();
+
+  let payload: {
     data?: T[];
     message?: string;
     error?: string;
+    type?: string;
   };
+
+  try {
+    payload = JSON.parse(raw) as typeof payload;
+  } catch {
+    throw new Error(
+      `Tenrai returned an invalid response. HTTP ${response.status}`,
+    );
+  }
 
   if (!response.ok || !Array.isArray(payload.data)) {
     throw new Error(
       payload.message ||
       payload.error ||
-      `Jikan API error: HTTP ${response.status}`,
+      payload.type ||
+      `Tenrai API error: HTTP ${response.status}`,
     );
   }
 
   return payload.data;
 }
 
-function getImageUrl(images?: JikanImageSet): string | undefined {
+// Extract the best available image URL.
+function getImageUrl(
+  images?: ImageSet,
+): string | undefined {
   return (
     images?.webp?.large_image_url ||
     images?.webp?.image_url ||
@@ -211,10 +240,12 @@ function getImageUrl(images?: JikanImageSet): string | undefined {
   );
 }
 
+// Build a safe anime search query.
 function searchUrl(query: string, limit: number) {
   const params = new URLSearchParams({
     q: query,
     limit: String(limit),
+    "sfw-strict": "true",
   });
 
   return params.toString();
@@ -223,25 +254,31 @@ function searchUrl(query: string, limit: number) {
 function createServer() {
   const server = new McpServer({
     name: "Anime Elara Publisher",
-    version: "2.1.0",
+    version: "2.2.0",
   });
 
-  // 1. Search anime images
+  // ==========================================
+  // 1. Search anime and character images
+  // ==========================================
+
   server.registerTool(
     "search_anime_images",
     {
       description:
-        "Search the Jikan anime database for character images, anime covers, or anime gallery pictures. Returns direct image URLs and source links. Use this tool to find images before publishing. Never publish unless the user explicitly asks.",
+        "Search Tenrai anime database for character images, anime covers, or anime galleries. Returns direct image URLs and source links. Use this tool to find images before publishing. Never publish unless the user explicitly asks.",
       inputSchema: z.object({
         query: z.string().min(2).max(100),
+
         kind: z.enum([
           "character",
           "anime_cover",
           "anime_gallery",
         ]).default("character"),
+
         max_results: z.number().int().min(1).max(8).default(6),
       }),
     },
+
     async ({ query, kind, max_results }) => {
       try {
         const results: {
@@ -253,8 +290,9 @@ function createServer() {
 
         const params = searchUrl(query, 5);
 
+        // Character search
         if (kind === "character") {
-          const matches = await jikanGet<JikanEntry>(
+          const matches = await tenraiGet<AnimeEntry>(
             `/characters?${params}`,
           );
 
@@ -271,16 +309,16 @@ function createServer() {
             }
           }
 
-          // Get extra pictures for the best character match.
+          // Fetch additional pictures for the best match.
           if (matches.length > 0) {
             const best = matches[0];
 
-            const pictures = await jikanGet<JikanEntry>(
+            const pictures = await tenraiGet<PictureEntry>(
               `/characters/${best.mal_id}/pictures`,
             );
 
             for (const picture of pictures) {
-              const image = getImageUrl(picture.images);
+              const image = getImageUrl(picture);
 
               if (image) {
                 results.push({
@@ -294,8 +332,9 @@ function createServer() {
           }
         }
 
+        // Anime cover search
         if (kind === "anime_cover") {
-          const matches = await jikanGet<JikanEntry>(
+          const matches = await tenraiGet<AnimeEntry>(
             `/anime?${params}`,
           );
 
@@ -313,20 +352,21 @@ function createServer() {
           }
         }
 
+        // Anime gallery search
         if (kind === "anime_gallery") {
-          const matches = await jikanGet<JikanEntry>(
+          const matches = await tenraiGet<AnimeEntry>(
             `/anime?${params}`,
           );
 
           if (matches.length > 0) {
             const best = matches[0];
 
-            const pictures = await jikanGet<JikanEntry>(
+            const pictures = await tenraiGet<PictureEntry>(
               `/anime/${best.mal_id}/pictures`,
             );
 
             for (const picture of pictures) {
-              const image = getImageUrl(picture.images);
+              const image = getImageUrl(picture);
 
               if (image) {
                 results.push({
@@ -338,6 +378,7 @@ function createServer() {
               }
             }
 
+            // If no gallery pictures exist, use the cover.
             if (results.length === 0) {
               const cover = getImageUrl(best.images);
 
@@ -375,7 +416,7 @@ function createServer() {
             text: JSON.stringify({
               query,
               kind,
-              source: "Jikan / MyAnimeList",
+              source: "Tenrai / MyAnimeList",
               results: unique,
             }, null, 2),
           }],
@@ -388,7 +429,10 @@ function createServer() {
     },
   );
 
-  // 2. Text-only post
+  // ==========================================
+  // 2. Publish text
+  // ==========================================
+
   server.registerTool(
     "publish_text",
     {
@@ -398,6 +442,7 @@ function createServer() {
         message: z.string().min(1).max(4096),
       }),
     },
+
     async ({ message }) => {
       try {
         await telegramJson("sendMessage", {
@@ -412,22 +457,28 @@ function createServer() {
           }],
         };
       } catch (error) {
-        return errorResult(`فشل نشر النص: ${String(error)}`);
+        return errorResult(
+          `فشل نشر النص: ${String(error)}`,
+        );
       }
     },
   );
 
-  // 3. Single photo + caption
+  // ==========================================
+  // 3. Publish one photo + caption
+  // ==========================================
+
   server.registerTool(
     "publish_photo",
     {
       description:
-        "Publish one image with a caption to @anime_elara. Use a direct public HTTPS image URL. Use ONLY after an explicit user request to publish.",
+        "Publish one image with a caption to @anime_elara. Supply a direct public HTTPS image URL. Use ONLY after an explicit user request to publish.",
       inputSchema: z.object({
         image_url: z.string().url().max(2048),
         caption: z.string().max(1024).optional(),
       }),
     },
+
     async ({ image_url, caption }) => {
       try {
         const image = await downloadImage(
@@ -436,7 +487,9 @@ function createServer() {
         );
 
         const form = new FormData();
+
         form.set("chat_id", CHANNEL);
+
         form.set(
           "photo",
           image.blob,
@@ -456,12 +509,17 @@ function createServer() {
           }],
         };
       } catch (error) {
-        return errorResult(`فشل نشر الصورة: ${String(error)}`);
+        return errorResult(
+          `فشل نشر الصورة: ${String(error)}`,
+        );
       }
     },
   );
 
-  // 4. Photo album
+  // ==========================================
+  // 4. Publish photo album
+  // ==========================================
+
   server.registerTool(
     "publish_album",
     {
@@ -471,12 +529,15 @@ function createServer() {
         image_urls: z.array(
           z.string().url().max(2048),
         ).min(2).max(10),
+
         caption: z.string().max(1024).optional(),
       }),
     },
+
     async ({ image_urls, caption }) => {
       try {
         const form = new FormData();
+
         form.set("chat_id", CHANNEL);
 
         const media: {
@@ -536,7 +597,9 @@ function createServer() {
           }],
         };
       } catch (error) {
-        return errorResult(`فشل نشر الألبوم: ${String(error)}`);
+        return errorResult(
+          `فشل نشر الألبوم: ${String(error)}`,
+        );
       }
     },
   );
@@ -544,7 +607,12 @@ function createServer() {
   return server;
 }
 
+// MCP handler
 const handler = createMcpHandler(createServer);
+
+// ==========================================
+// Protected Worker entry point
+// ==========================================
 
 export default {
   async fetch(
@@ -564,18 +632,25 @@ export default {
     }
 
     const url = new URL(request.url);
+
     const protectedPath = `/s/${secret}/mcp`;
 
     if (url.pathname !== protectedPath) {
       return new Response("Not found", {
         status: 404,
-        headers: { "Cache-Control": "no-store" },
+        headers: {
+          "Cache-Control": "no-store",
+        },
       });
     }
 
+    // Rewrite protected path to the normal MCP endpoint.
     url.pathname = "/mcp";
 
-    const mcpRequest = new Request(url.toString(), request);
+    const mcpRequest = new Request(
+      url.toString(),
+      request,
+    );
 
     return handler(mcpRequest, env, ctx);
   },
