@@ -1,14 +1,19 @@
-/**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
- */
+
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "anime-elara-mcpv2",
-	"main": "src/index.ts",
-	"compatibility_date": "2026-07-02",
-	"compatibility_flags": ["nodejs_compat"],
-	"observability": {
-		"enabled": true,
-	},
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "anime-elara-mcpv2",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-02",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "anime-elara-db",
+      "database_id": "f986328d-9fb7-482a-ab6c-9694c8857e41",
+      "migrations_dir": "migrations"
+    }
+  ]
 }
