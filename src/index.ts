@@ -1,3 +1,4 @@
+
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { env as workerEnv } from "cloudflare:workers";
@@ -7,12 +8,15 @@ declare global {
   interface Env {
     TELEGRAM_BOT_TOKEN: string;
     MCP_ACCESS_TOKEN: string;
+    TMDB_READ_TOKEN: string;
   }
 }
 
 const CHANNEL = "@anime_elara";
 const TENRAI_API = "https://api.tenrai.org/v1";
+const TMDB_API = "https://api.themoviedb.org/3";
 const TELEGRAM_API = `https://api.telegram.org/bot${workerEnv.TELEGRAM_BOT_TOKEN}`;
+
 const MAX_PHOTO_SIZE = 9 * 1024 * 1024;
 const MAX_ALBUM_IMAGE_SIZE = 5 * 1024 * 1024;
 const MAX_ALBUM_TOTAL_SIZE = 25 * 1024 * 1024;
@@ -90,8 +94,10 @@ function safeEndpoint(path: string): string {
 
 function getRateLimitHeaders(headers: Headers): Record<string, string> {
   const selected: Record<string, string> = {};
+
   for (const [name, value] of headers.entries()) {
     const lower = name.toLowerCase();
+
     if (
       lower === "retry-after" ||
       lower.includes("ratelimit") ||
@@ -101,6 +107,7 @@ function getRateLimitHeaders(headers: Headers): Record<string, string> {
       selected[name] = value;
     }
   }
+
   return selected;
 }
 
@@ -118,6 +125,7 @@ async function tenraiRequest<T>(path: string) {
   const started = Date.now();
 
   let response: Response;
+
   try {
     response = await fetch(endpoint, {
       headers: { Accept: "application/json" },
@@ -125,6 +133,7 @@ async function tenraiRequest<T>(path: string) {
     });
   } catch (error) {
     const elapsedMs = Date.now() - started;
+
     throw new Error(
       `Tenrai network/timeout error after ${elapsedMs}ms for ${path}: ${String(error)}`,
     );
@@ -182,11 +191,13 @@ async function telegramJson(
   });
 
   const result = (await response.json()) as TelegramResult;
+
   if (!response.ok || !result.ok) {
     throw new Error(
       result.description || `Telegram HTTP ${response.status}`,
     );
   }
+
   return result;
 }
 
@@ -198,11 +209,13 @@ async function telegramForm(method: string, form: FormData) {
   });
 
   const result = (await response.json()) as TelegramResult;
+
   if (!response.ok || !result.ok) {
     throw new Error(
       result.description || `Telegram HTTP ${response.status}`,
     );
   }
+
   return result;
 }
 
@@ -212,6 +225,7 @@ async function downloadImage(
   maxBytes: number,
 ): Promise<{ blob: Blob; type: string }> {
   const url = new URL(imageUrl);
+
   if (
     url.protocol !== "https:" ||
     url.username ||
@@ -246,6 +260,7 @@ async function downloadImage(
   const contentLength = Number(
     response.headers.get("content-length") || 0,
   );
+
   if (contentLength > maxBytes) {
     throw new Error("حجم الصورة أكبر من الحد المسموح.");
   }
@@ -256,13 +271,16 @@ async function downloadImage(
 
   while (true) {
     const { done, value } = await reader.read();
+
     if (done) break;
 
     total += value.length;
+
     if (total > maxBytes) {
       await reader.cancel();
       throw new Error("حجم الصورة أكبر من الحد المسموح.");
     }
+
     chunks.push(value);
   }
 
@@ -307,7 +325,7 @@ function searchUrl(query: string, limit: number) {
 function formatTenraiError(error: unknown): string {
   if (error instanceof TenraiApiError) {
     return [
-      `Tenrai request failed`,
+      "Tenrai request failed",
       `HTTP status: ${error.status}`,
       `Endpoint path: ${error.endpoint}`,
       `Retry-After: ${error.retryAfter ?? "not provided"}`,
@@ -316,14 +334,157 @@ function formatTenraiError(error: unknown): string {
       `Response body (first 700 chars): ${error.responseBody || "(empty)"}`,
     ].join("\n");
   }
+
   return String(error);
 }
 
 function createServer() {
   const server = new McpServer({
     name: "Anime Elara Publisher",
-    version: "2.3.0",
+    version: "2.3.1",
   });
+
+  // TMDB read-only diagnostic.
+  // Exactly ONE request. Never publishes to Telegram.
+  server.registerTool(
+    "diagnose_tmdb",
+    {
+      description:
+        "Test TMDB Bearer authentication and search for an anime using exactly one read-only Multi Search request. Reports HTTP status, response time, matching titles, and poster/backdrop availability. Never publishes to Telegram and never reveals credentials.",
+      inputSchema: z.object({
+        query: z.string().min(2).max(100).default("Frieren"),
+      }),
+    },
+    async ({ query }) => {
+      const token = workerEnv.TMDB_READ_TOKEN;
+
+      if (!token) {
+        return errorResult(
+          "TMDB_READ_TOKEN is missing from Cloudflare Secrets.",
+        );
+      }
+
+      const params = new URLSearchParams({
+        query,
+        include_adult: "false",
+        language: "en-US",
+        page: "1",
+      });
+
+      const endpoint = `/search/multi?${params.toString()}`;
+      const started = Date.now();
+
+      try {
+        const response = await fetch(
+          `${TMDB_API}${endpoint}`,
+          {
+            method: "GET",
+            headers: {
+              Accept: "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            signal: AbortSignal.timeout(15000),
+          },
+        );
+
+        const elapsedMs = Date.now() - started;
+        const raw = await response.text();
+
+        let payload: {
+          results?: {
+            id?: number;
+            media_type?: string;
+            title?: string;
+            name?: string;
+            original_title?: string;
+            original_name?: string;
+            poster_path?: string | null;
+            backdrop_path?: string | null;
+          }[];
+          status_message?: string;
+        };
+
+        try {
+          payload = JSON.parse(raw);
+        } catch {
+          return errorResult(
+            `TMDB returned invalid JSON. HTTP ${response.status}.`,
+          );
+        }
+
+        if (!response.ok) {
+          return errorResult(
+            [
+              "TMDB diagnostic failed.",
+              `HTTP status: ${response.status}`,
+              `Elapsed: ${elapsedMs}ms`,
+              `Message: ${payload.status_message || "Unknown API error"}`,
+              "Credential value was not exposed.",
+            ].join("\n"),
+          );
+        }
+
+        const results = Array.isArray(payload.results)
+          ? payload.results
+          : [];
+
+        const matches = results
+          .filter(
+            (item) =>
+              item.media_type === "movie" ||
+              item.media_type === "tv",
+          )
+          .slice(0, 5)
+          .map((item) => ({
+            id: item.id ?? null,
+            media_type: item.media_type,
+            title:
+              item.title ||
+              item.name ||
+              item.original_title ||
+              item.original_name ||
+              "Unknown",
+            original_title:
+              item.original_title ||
+              item.original_name ||
+              null,
+            has_poster: Boolean(item.poster_path),
+            has_backdrop: Boolean(item.backdrop_path),
+            poster_url: item.poster_path
+              ? `https://image.tmdb.org/t/p/w500${item.poster_path}`
+              : null,
+            backdrop_url: item.backdrop_path
+              ? `https://image.tmdb.org/t/p/w1280${item.backdrop_path}`
+              : null,
+          }));
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              ok: true,
+              service: "TMDB",
+              http_status: response.status,
+              elapsed_ms: elapsedMs,
+              query,
+              total_results: results.length,
+              matching_titles: matches,
+              note:
+                "Exactly one read-only request. Images were not downloaded. No Telegram action. Token was not exposed.",
+            }, null, 2),
+          }],
+        };
+      } catch (error) {
+        return errorResult(
+          `TMDB network/timeout error: ${
+            error instanceof Error
+              ? error.message
+              : "Unknown error"
+          }. Credential value was not exposed.`,
+        );
+      }
+    },
+  );
 
   // Read-only diagnostic: makes exactly ONE Tenrai request.
   server.registerTool(
@@ -337,6 +498,7 @@ function createServer() {
     },
     async ({ query }) => {
       const path = `/characters?${searchUrl(query, 1)}`;
+
       try {
         const result = await tenraiRequest<AnimeEntry>(path);
         const first = result.data[0];
@@ -361,7 +523,8 @@ function createServer() {
                     source_url: first.url ?? null,
                   }
                 : null,
-              note: "One request only. No images downloaded. No Telegram action.",
+              note:
+                "One request only. No images downloaded. No Telegram action.",
             }, null, 2),
           }],
         };
@@ -405,6 +568,7 @@ function createServer() {
 
           for (const item of matches) {
             const image = getImageUrl(item.images);
+
             if (image) {
               results.push({
                 name: item.name || "Unknown character",
@@ -418,12 +582,14 @@ function createServer() {
           // Sequential second request for the best match only.
           if (matches.length > 0) {
             const best = matches[0];
+
             const pictures = await tenraiGet<PictureEntry>(
               `/characters/${best.mal_id}/pictures`,
             );
 
             for (const picture of pictures) {
               const image = getImageUrl(picture);
+
               if (image) {
                 results.push({
                   name: best.name || "Character gallery",
@@ -440,8 +606,10 @@ function createServer() {
           const matches = await tenraiGet<AnimeEntry>(
             `/anime?${params}`,
           );
+
           for (const item of matches) {
             const image = getImageUrl(item.images);
+
             if (image) {
               results.push({
                 name: item.title || "Unknown anime",
@@ -460,12 +628,14 @@ function createServer() {
 
           if (matches.length > 0) {
             const best = matches[0];
+
             const pictures = await tenraiGet<PictureEntry>(
               `/anime/${best.mal_id}/pictures`,
             );
 
             for (const picture of pictures) {
               const image = getImageUrl(picture);
+
               if (image) {
                 results.push({
                   name: best.title || "Anime gallery",
@@ -478,6 +648,7 @@ function createServer() {
 
             if (results.length === 0) {
               const cover = getImageUrl(best.images);
+
               if (cover) {
                 results.push({
                   name: best.title || "Anime cover",
@@ -540,6 +711,7 @@ function createServer() {
           chat_id: CHANNEL,
           text: message,
         });
+
         return {
           content: [{
             type: "text",
@@ -565,7 +737,11 @@ function createServer() {
     },
     async ({ image_url, caption }) => {
       try {
-        const image = await downloadImage(image_url, MAX_PHOTO_SIZE);
+        const image = await downloadImage(
+          image_url,
+          MAX_PHOTO_SIZE,
+        );
+
         const form = new FormData();
         form.set("chat_id", CHANNEL);
         form.set(
@@ -573,9 +749,13 @@ function createServer() {
           image.blob,
           `anime-image.${extensionFor(image.type)}`,
         );
-        if (caption) form.set("caption", caption);
+
+        if (caption) {
+          form.set("caption", caption);
+        }
 
         await telegramForm("sendPhoto", form);
+
         return {
           content: [{
             type: "text",
@@ -621,6 +801,7 @@ function createServer() {
           );
 
           totalSize += image.blob.size;
+
           if (totalSize > MAX_ALBUM_TOTAL_SIZE) {
             throw new Error(
               "الحجم الإجمالي للألبوم أكبر من الحد المسموح.",
@@ -628,6 +809,7 @@ function createServer() {
           }
 
           const attachmentName = `photo_${i}`;
+
           form.set(
             attachmentName,
             image.blob,
@@ -643,7 +825,10 @@ function createServer() {
             media: `attach://${attachmentName}`,
           };
 
-          if (i === 0 && caption) item.caption = caption;
+          if (i === 0 && caption) {
+            item.caption = caption;
+          }
+
           media.push(item);
         }
 
@@ -675,7 +860,10 @@ export default {
   ) {
     const secret = workerEnv.MCP_ACCESS_TOKEN;
 
-    if (!secret || !workerEnv.TELEGRAM_BOT_TOKEN) {
+    if (
+      !secret ||
+      !workerEnv.TELEGRAM_BOT_TOKEN
+    ) {
       return new Response("Server configuration error", {
         status: 503,
       });
@@ -692,7 +880,12 @@ export default {
     }
 
     url.pathname = "/mcp";
-    const mcpRequest = new Request(url.toString(), request);
+
+    const mcpRequest = new Request(
+      url.toString(),
+      request,
+    );
+
     return handler(mcpRequest, env, ctx);
   },
 } satisfies ExportedHandler<Env>;
